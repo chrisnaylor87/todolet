@@ -1,7 +1,6 @@
 # Flathub manifest for Todolet.
 #
-# To submit: push the repo to GitHub, tag v1.0.0, fill in OWNER and the
-# sha256 below (curl -L <url> | sha256sum), then follow
+# To submit: fill in the sha256 below (curl -L <url> | sha256sum), then follow
 # https://docs.flathub.org/docs/for-app-authors/submission
 # (PR against https://github.com/flathub/flathub adding this file).
 #
@@ -26,5 +25,5 @@ modules:
         /app/share/metainfo/app.todolet.Todolet.metainfo.xml
     sources:
       - type: archive
-        url: https://github.com/OWNER/todolet-linux/archive/refs/tags/v1.0.0.tar.gz
+        url: https://github.com/chrisnaylor87/todolet/archive/refs/tags/v1.0.0.tar.gz
         sha256: FILL_IN_AFTER_TAGGING
