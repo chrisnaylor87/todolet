@@ -1,0 +1,654 @@
+#!/usr/bin/env python3
+"""Todolet for Linux — a week-at-a-glance to-do app for the terminal.
+
+Same idea as todolet.app: see the week ahead, add tasks to a day, tick them
+off. No accounts, no cloud, no dependencies — one Python file and a JSON file.
+
+The data file uses the exact same shape as the web app's localStorage
+({"YYYY-MM-DD": [{id, text, done}]}), and `export`/`import` read and write the
+web app's backup format, so backups move freely between phone and terminal.
+
+Usage:
+  todolet                 open the TUI
+  todolet add TEXT [DAY]  quick-add a task (DAY: today, tomorrow, mon..sun,
+                          +N days, or YYYY-MM-DD; default today)
+  todolet list [OFFSET]   print a week (OFFSET in weeks: 0, +1, -2, ...)
+  todolet export [FILE]   write a backup JSON (todolet.app format)
+  todolet import FILE     merge a backup JSON (accepts web-app backups)
+  todolet ical [OFFSET|FILE]  export a week as an iCal .ics file
+  todolet help | version  show this help / the version
+"""
+
+import curses
+import json
+import locale
+import os
+import random
+import sys
+import time
+from datetime import date, datetime, timedelta, timezone
+
+__version__ = '1.0.0'
+
+MAX_LEN = 200  # same task-length cap as the web app
+
+DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+          'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+
+# ── Storage ──────────────────────────────────────────────────────────────────
+
+def data_path():
+    base = os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
+    return os.path.join(base, 'todolet', 'todolet.json')
+
+
+def load_all():
+    try:
+        with open(data_path()) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, OSError):
+        # Don't silently clobber a corrupt file; set it aside and start fresh.
+        p = data_path()
+        try:
+            os.replace(p, p + '.corrupt-' + datetime.now().strftime('%Y%m%d%H%M%S'))
+        except OSError:
+            pass
+        return {}
+
+
+def save_all(data):
+    p = data_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, p)
+
+
+def uid():
+    # Same scheme as the web app: base36 timestamp + 4 random base36 chars.
+    a36 = '0123456789abcdefghijklmnopqrstuvwxyz'
+    n, s = int(time.time() * 1000), ''
+    while n:
+        n, r = divmod(n, 36)
+        s = a36[r] + s
+    return s + ''.join(random.choice(a36) for _ in range(4))
+
+
+# ── Dates ────────────────────────────────────────────────────────────────────
+
+def get_key(d):
+    return f'{d.year:04d}-{d.month:02d}-{d.day:02d}'
+
+
+def get_monday(d):
+    return d - timedelta(days=d.weekday())
+
+
+def week_days(offset):
+    ws = get_monday(date.today()) + timedelta(weeks=offset)
+    return [ws + timedelta(days=i) for i in range(7)]
+
+
+def week_label(offset):
+    days = week_days(offset)
+    a, b = days[0], days[6]
+    if a.month == b.month:
+        s = f'{a.day} – {b.day} {MONTHS[b.month - 1]}'
+    else:
+        s = f'{a.day} {MONTHS[a.month - 1]} – {b.day} {MONTHS[b.month - 1]}'
+    if a.year != date.today().year or b.year != date.today().year:
+        s += f' {b.year}'
+    return s
+
+
+def day_label(d):
+    return f'{DAYS[d.weekday()]} {d.day} {MONTHS[d.month - 1]}'
+
+
+def parse_day(arg):
+    """today | tomorrow | mon..sunday | +N | YYYY-MM-DD → date, or None."""
+    a = arg.strip().lower()
+    today = date.today()
+    if a in ('today', ''):
+        return today
+    if a == 'tomorrow':
+        return today + timedelta(days=1)
+    if a.startswith('+') and a[1:].isdigit():
+        return today + timedelta(days=int(a[1:]))
+    for i, name in enumerate(['monday', 'tuesday', 'wednesday', 'thursday',
+                              'friday', 'saturday', 'sunday']):
+        if name.startswith(a) and len(a) >= 3:
+            delta = (i - today.weekday()) % 7  # next occurrence, today counts
+            return today + timedelta(days=delta)
+    try:
+        return datetime.strptime(a, '%Y-%m-%d').date()
+    except ValueError:
+        return None
+
+
+# ── Task operations (shared by CLI and TUI) ─────────────────────────────────
+
+def add_task(data, key, text):
+    text = text.strip()[:MAX_LEN]
+    if not text:
+        return None
+    t = {'id': uid(), 'text': text, 'done': False}
+    data.setdefault(key, []).append(t)
+    return t
+
+
+def merge_backup(data, incoming):
+    """Merge with the web app's exact import semantics; returns tasks added."""
+    added = 0
+    for key, todos in incoming.items():
+        if not isinstance(key, str) or not isinstance(todos, list):
+            continue
+        try:
+            datetime.strptime(key, '%Y-%m-%d')
+        except ValueError:
+            continue
+        existing = data.get(key, [])
+        ids = {t.get('id') for t in existing if isinstance(t, dict)}
+        for t in todos:
+            if not isinstance(t, dict) or not isinstance(t.get('text'), str):
+                continue
+            text = t['text'].strip()
+            if not text or t.get('id') in ids:
+                continue
+            tid = t['id'] if isinstance(t.get('id'), str) and t['id'] else uid()
+            existing.append({'id': tid, 'text': text[:MAX_LEN], 'done': bool(t.get('done'))})
+            ids.add(tid)
+            added += 1
+        if existing:
+            data[key] = existing
+    return added
+
+
+# ── CLI commands ─────────────────────────────────────────────────────────────
+
+def cmd_add(args):
+    if not args:
+        sys.exit('usage: todolet add TEXT [DAY]')
+    day = date.today()
+    if len(args) > 1 and (d := parse_day(args[-1])):
+        day, args = d, args[:-1]
+    text = ' '.join(args)
+    data = load_all()
+    t = add_task(data, get_key(day), text)
+    if not t:
+        sys.exit('todolet: empty task')
+    save_all(data)
+    print(f'Added to {day_label(day)}: {t["text"]}')
+
+
+def cmd_list(args):
+    try:
+        offset = int(args[0]) if args else 0
+    except ValueError:
+        sys.exit('usage: todolet list [OFFSET]  (e.g. todolet list +1)')
+    data = load_all()
+    print(f'Week of {week_label(offset)}\n')
+    shown = 0
+    for d in week_days(offset):
+        todos = data.get(get_key(d), [])
+        if not todos:
+            continue
+        label = 'Today' if d == date.today() else day_label(d)
+        for i, t in enumerate(todos):
+            box = '[x]' if t.get('done') else '[ ]'
+            print(f'  {label if i == 0 else "":<12} {box} {t.get("text", "")}')
+        shown += len(todos)
+    if not shown:
+        print('  Nothing planned this week.')
+
+
+def cmd_export(args):
+    data = load_all()
+    payload = {'app': 'todolet', 'version': 1,
+               'exportedAt': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z'),
+               'data': data}
+    out = args[0] if args else f'todolet-backup-{get_key(date.today())}.json'
+    with open(out, 'w') as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    n = sum(len(v) for v in data.values())
+    print(f'Exported {n} task{"s" if n != 1 else ""} to {out}')
+
+
+def cmd_import(args):
+    if not args:
+        sys.exit('usage: todolet import FILE')
+    with open(args[0]) as f:
+        parsed = json.load(f)
+    # Accept both the wrapped backup format and a bare data object.
+    incoming = parsed.get('data') if isinstance(parsed, dict) and parsed.get('app') == 'todolet' else parsed
+    if not isinstance(incoming, dict):
+        sys.exit('todolet: not a Todolet backup file')
+    data = load_all()
+    added = merge_backup(data, incoming)
+    save_all(data)
+    print(f'Imported {added} task{"s" if added != 1 else ""} (merged, nothing deleted).')
+
+
+def cmd_ical(args):
+    offset, out = 0, None
+    for a in args:
+        try:
+            offset = int(a)
+        except ValueError:
+            out = a
+    data = load_all()
+    days = week_days(offset)
+    todos = [(t, get_key(d).replace('-', ''))
+             for d in days for t in data.get(get_key(d), [])]
+    if not todos:
+        sys.exit('todolet: nothing planned in that week')
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    esc = lambda s: (s.replace('\\', '\\\\').replace(';', '\\;')
+                      .replace(',', '\\,').replace('\n', '\\n'))
+    lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Todolet//EN',
+             'CALSCALE:GREGORIAN']
+    for t, ds in todos:
+        lines += ['BEGIN:VTODO', f'UID:{t["id"]}@todolet.app', f'DTSTAMP:{stamp}',
+                  f'DTSTART;VALUE=DATE:{ds}', f'DUE;VALUE=DATE:{ds}',
+                  f'SUMMARY:{esc(t["text"])}',
+                  f'STATUS:{"COMPLETED" if t.get("done") else "NEEDS-ACTION"}']
+        if t.get('done'):
+            lines.append('PERCENT-COMPLETE:100')
+        lines.append('END:VTODO')
+    lines.append('END:VCALENDAR')
+    out = out or f'todolet-{get_key(days[0])}.ics'
+    with open(out, 'w', newline='') as f:
+        f.write('\r\n'.join(lines) + '\r\n')
+    print(f'Exported {len(todos)} task{"s" if len(todos) != 1 else ""} to {out}')
+
+
+# ── TUI ──────────────────────────────────────────────────────────────────────
+
+C_ACCENT, C_MUTED, C_DONE, C_TODAY = 1, 2, 3, 4
+
+
+def safe_add(scr, y, x, s, attr=0):
+    h, w = scr.getmaxyx()
+    if 0 <= y < h and x < w:
+        try:
+            scr.addstr(y, x, s[:w - x - 1], attr)
+        except curses.error:
+            pass
+
+
+def line_input(scr, prompt, initial=''):
+    """Single-line editor on the bottom row. Enter → str, Esc → None."""
+    buf, pos = list(initial), len(initial)
+    curses.curs_set(1)
+    try:
+        while True:
+            h, w = scr.getmaxyx()
+            y = h - 1
+            avail = max(1, w - len(prompt) - 2)
+            start = max(0, pos - avail + 1)
+            scr.move(y, 0)
+            scr.clrtoeol()
+            safe_add(scr, y, 0, prompt, curses.color_pair(C_ACCENT) | curses.A_BOLD)
+            safe_add(scr, y, len(prompt), ''.join(buf)[start:start + avail])
+            try:
+                scr.move(y, min(w - 1, len(prompt) + pos - start))
+            except curses.error:
+                pass
+            ch = scr.get_wch()
+            if ch in ('\n', '\r') or ch == curses.KEY_ENTER:
+                return ''.join(buf).strip()
+            if ch == '\x1b':
+                return None
+            if ch in (curses.KEY_BACKSPACE, '\x7f', '\x08'):
+                if pos:
+                    pos -= 1
+                    buf.pop(pos)
+            elif ch == curses.KEY_DC:
+                if pos < len(buf):
+                    buf.pop(pos)
+            elif ch == curses.KEY_LEFT:
+                pos = max(0, pos - 1)
+            elif ch == curses.KEY_RIGHT:
+                pos = min(len(buf), pos + 1)
+            elif ch == curses.KEY_HOME:
+                pos = 0
+            elif ch == curses.KEY_END:
+                pos = len(buf)
+            elif isinstance(ch, str) and ch.isprintable() and len(buf) < MAX_LEN:
+                buf.insert(pos, ch)
+                pos += 1
+    finally:
+        curses.curs_set(0)
+
+
+HELP = [
+    ('↑ ↓  j k', 'move'),
+    ('← →  h l', 'previous / next week'),
+    ('space / enter', 'tick a task off (enter on a day: add)'),
+    ('a', 'add a task to the selected day'),
+    ('e', 'edit the selected task'),
+    ('d', 'delete the selected task'),
+    ('u', 'undo the last delete'),
+    ('t', 'jump back to today'),
+    ('g / G', 'top / bottom'),
+    ('q', 'quit'),
+]
+
+
+class Tui:
+    def __init__(self, scr):
+        self.scr = scr
+        self.data = load_all()
+        self.offset = 0        # weeks from the current week
+        self.lines = []        # display lines: dicts with kind day|task|blank|note
+        self.cursor = 0        # index into self.lines (always a selectable line)
+        self.top = 0           # first body line on screen
+        self.msg = ''
+        self.trash = []        # (key, index, task) for undo
+        self.build()
+        self.select_today()
+
+    # ── model ──
+    def build(self):
+        self.lines = []
+        for d in week_days(self.offset):
+            key = get_key(d)
+            self.lines.append({'kind': 'day', 'key': key, 'date': d})
+            for i in range(len(self.data.get(key, []))):
+                self.lines.append({'kind': 'task', 'key': key, 'idx': i, 'date': d})
+            self.lines.append({'kind': 'blank'})
+        if not any(self.data.get(get_key(d)) for d in week_days(self.offset)):
+            self.lines.append({'kind': 'note'})
+
+    def selectable(self, i):
+        return self.lines[i]['kind'] in ('day', 'task')
+
+    def clamp_cursor(self):
+        if not (0 <= self.cursor < len(self.lines)) or not self.selectable(self.cursor):
+            sel = [i for i in range(len(self.lines)) if self.selectable(i)]
+            self.cursor = min(sel, key=lambda i: abs(i - self.cursor)) if sel else 0
+
+    def move(self, step):
+        i = self.cursor + step
+        while 0 <= i < len(self.lines):
+            if self.selectable(i):
+                self.cursor = i
+                return
+            i += step
+
+    def select_today(self):
+        for i, ln in enumerate(self.lines):
+            if ln['kind'] == 'day' and ln['date'] == date.today():
+                self.cursor = i
+                return
+        self.clamp_cursor()
+
+    def current(self):
+        return self.lines[self.cursor]
+
+    def save(self):
+        save_all(self.data)
+
+    # ── actions ──
+    def add(self):
+        ln = self.current()
+        label = 'today' if ln['date'] == date.today() else day_label(ln['date'])
+        text = line_input(self.scr, f' Add to {label}: ')
+        if text:
+            add_task(self.data, ln['key'], text)
+            self.save()
+            self.build()
+            # land on the new task (last one in that day)
+            for i, l in enumerate(self.lines):
+                if l['kind'] == 'task' and l['key'] == ln['key']:
+                    self.cursor = i
+            self.msg = 'Added.'
+
+    def toggle(self):
+        ln = self.current()
+        if ln['kind'] == 'day':
+            self.add()
+            return
+        t = self.data[ln['key']][ln['idx']]
+        t['done'] = not t.get('done')
+        self.save()
+
+    def edit(self):
+        ln = self.current()
+        if ln['kind'] != 'task':
+            return
+        t = self.data[ln['key']][ln['idx']]
+        text = line_input(self.scr, ' Edit: ', t.get('text', ''))
+        if text is None:
+            return
+        if text:
+            t['text'] = text[:MAX_LEN]
+        else:
+            self.data[ln['key']].pop(ln['idx'])
+            if not self.data[ln['key']]:
+                del self.data[ln['key']]
+        self.save()
+        self.build()
+        self.clamp_cursor()
+
+    def delete(self):
+        ln = self.current()
+        if ln['kind'] != 'task':
+            return
+        t = self.data[ln['key']].pop(ln['idx'])
+        if not self.data[ln['key']]:
+            del self.data[ln['key']]
+        self.trash.append((ln['key'], ln['idx'], t))
+        self.save()
+        self.build()
+        self.clamp_cursor()
+        self.msg = 'Deleted — press u to undo.'
+
+    def undo(self):
+        if not self.trash:
+            self.msg = 'Nothing to undo.'
+            return
+        key, idx, t = self.trash.pop()
+        todos = self.data.setdefault(key, [])
+        todos.insert(min(idx, len(todos)), t)
+        self.save()
+        self.build()
+        for i, l in enumerate(self.lines):
+            if l['kind'] == 'task' and l['key'] == key and l.get('idx') == min(idx, len(todos) - 1):
+                self.cursor = i
+        self.msg = 'Restored.'
+
+    def shift_week(self, step):
+        self.offset += step
+        self.build()
+        if self.offset == 0:
+            self.select_today()
+        else:
+            self.cursor = 0
+            self.clamp_cursor()
+        self.top = 0
+
+    # ── drawing ──
+    def draw(self):
+        scr = self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        body_h = h - 4
+        if body_h < 1 or w < 20:
+            safe_add(scr, 0, 0, 'Terminal too small')
+            scr.refresh()
+            return
+
+        # header
+        title = ' TODOLET'
+        safe_add(scr, 0, 0, title, curses.color_pair(C_ACCENT) | curses.A_BOLD)
+        label = week_label(self.offset)
+        mid = f'‹  {label}  ›'
+        attr = curses.color_pair(C_ACCENT) if self.offset == 0 else curses.A_BOLD
+        safe_add(scr, 0, max(len(title) + 2, (w - len(mid)) // 2), mid, attr)
+        if self.offset != 0:
+            hint = f'{self.offset:+d}w · t: today '
+            safe_add(scr, 0, w - len(hint) - 1, hint, curses.color_pair(C_MUTED))
+        safe_add(scr, 1, 0, '─' * (w - 1), curses.color_pair(C_MUTED))
+
+        # keep cursor visible
+        if self.cursor < self.top:
+            self.top = self.cursor
+        if self.cursor >= self.top + body_h:
+            self.top = self.cursor - body_h + 1
+        self.top = max(0, min(self.top, max(0, len(self.lines) - body_h)))
+
+        # body
+        for row in range(body_h):
+            i = self.top + row
+            if i >= len(self.lines):
+                break
+            y = 2 + row
+            ln = self.lines[i]
+            sel = (i == self.cursor)
+            if ln['kind'] == 'day':
+                d = ln['date']
+                todos = self.data.get(ln['key'], [])
+                today = d == date.today()
+                name = ('TODAY · ' if today else '') + day_label(d).upper()
+                attr = curses.A_BOLD | (curses.color_pair(C_TODAY) if today else 0)
+                if sel:
+                    attr |= curses.A_REVERSE
+                safe_add(scr, y, 1, f' {name} ', attr)
+                if todos:
+                    done = sum(1 for t in todos if t.get('done'))
+                    badge = f'{done}/{len(todos)}'
+                    battr = curses.color_pair(C_ACCENT) if done == len(todos) else curses.color_pair(C_MUTED)
+                    safe_add(scr, y, w - len(badge) - 2, badge, battr)
+            elif ln['kind'] == 'task':
+                t = self.data[ln['key']][ln['idx']]
+                done = t.get('done')
+                box = '[x]' if done else '[ ]'
+                battr = curses.color_pair(C_ACCENT) if done else 0
+                tattr = curses.color_pair(C_DONE) | curses.A_DIM if done else 0
+                if sel:
+                    battr |= curses.A_REVERSE
+                    tattr |= curses.A_REVERSE
+                safe_add(scr, y, 3, box, battr)
+                safe_add(scr, y, 7, t.get('text', ''), tattr)
+            elif ln['kind'] == 'note':
+                safe_add(scr, y, 3, 'Nothing planned this week. Press a to add a task.',
+                         curses.color_pair(C_MUTED))
+
+        # footer
+        safe_add(scr, h - 2, 0, '─' * (w - 1), curses.color_pair(C_MUTED))
+        if self.msg:
+            safe_add(scr, h - 1, 1, self.msg, curses.color_pair(C_MUTED))
+        else:
+            hints = ' a add · space done · e edit · d del · ←→ week · t today · ? help · q quit'
+            safe_add(scr, h - 1, 0, hints, curses.color_pair(C_MUTED))
+        scr.refresh()
+
+    def draw_help(self):
+        scr = self.scr
+        h, w = scr.getmaxyx()
+        bw = min(w - 4, 56)
+        bh = len(HELP) + 6
+        y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+        win = curses.newwin(min(bh, h), bw, y0, x0)
+        win.erase()
+        win.box()
+        safe_add(win, 1, 2, 'TODOLET — keys', curses.color_pair(C_ACCENT) | curses.A_BOLD)
+        for i, (k, desc) in enumerate(HELP):
+            safe_add(win, 3 + i, 3, f'{k:<15}', curses.A_BOLD)
+            safe_add(win, 3 + i, 19, desc)
+        safe_add(win, bh - 2, 2, f'data: {data_path()}', curses.color_pair(C_MUTED))
+        win.refresh()
+        scr.get_wch()
+
+    # ── main loop ──
+    def run(self):
+        curses.curs_set(0)
+        while True:
+            self.draw()
+            try:
+                ch = self.scr.get_wch()
+            except curses.error:
+                continue
+            self.msg = ''
+            if ch == curses.KEY_RESIZE:
+                continue
+            if ch in ('q', 'Q'):
+                return
+            if ch in ('?',) or ch == curses.KEY_F1:
+                self.draw_help()
+            elif ch in (curses.KEY_UP, 'k'):
+                self.move(-1)
+            elif ch in (curses.KEY_DOWN, 'j'):
+                self.move(1)
+            elif ch in (curses.KEY_LEFT, 'h'):
+                self.shift_week(-1)
+            elif ch in (curses.KEY_RIGHT, 'l'):
+                self.shift_week(1)
+            elif ch == 't':
+                self.offset = 0
+                self.build()
+                self.select_today()
+            elif ch in (' ', '\n', '\r') or ch == curses.KEY_ENTER:
+                self.toggle()
+            elif ch in ('a', 'i'):
+                self.add()
+            elif ch == 'e':
+                self.edit()
+            elif ch in ('d', 'x'):
+                self.delete()
+            elif ch == 'u':
+                self.undo()
+            elif ch == 'g':
+                self.cursor = 0
+                self.clamp_cursor()
+            elif ch == 'G':
+                self.cursor = len(self.lines) - 1
+                self.clamp_cursor()
+
+
+def tui(scr):
+    curses.use_default_colors()
+    if curses.has_colors():
+        curses.start_color()
+        grey = 8 if curses.COLORS >= 16 else curses.COLOR_WHITE
+        curses.init_pair(C_ACCENT, curses.COLOR_GREEN, -1)
+        curses.init_pair(C_MUTED, grey, -1)
+        curses.init_pair(C_DONE, grey, -1)
+        curses.init_pair(C_TODAY, curses.COLOR_GREEN, -1)
+    Tui(scr).run()
+
+
+# ── entry point ──────────────────────────────────────────────────────────────
+
+def main():
+    locale.setlocale(locale.LC_ALL, '')
+    args = sys.argv[1:]
+    if not args:
+        curses.wrapper(tui)
+    elif args[0] == 'add':
+        cmd_add(args[1:])
+    elif args[0] == 'list':
+        cmd_list(args[1:])
+    elif args[0] == 'export':
+        cmd_export(args[1:])
+    elif args[0] == 'import':
+        cmd_import(args[1:])
+    elif args[0] == 'ical':
+        cmd_ical(args[1:])
+    elif args[0] in ('help', '--help', '-h'):
+        print(__doc__.strip())
+    elif args[0] in ('version', '--version', '-V'):
+        print(f'todolet {__version__}')
+    else:
+        sys.exit(f'todolet: unknown command {args[0]!r} (try: todolet help)')
+
+
+if __name__ == '__main__':
+    main()

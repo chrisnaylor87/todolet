@@ -1,0 +1,78 @@
+.TH TODOLET 1 "July 2026" "todolet 1.0.0" "User Commands"
+.SH NAME
+todolet \- week-at-a-glance to-do list for the terminal
+.SH SYNOPSIS
+.B todolet
+.br
+.B todolet add
+.I TEXT
+.RI [ DAY ]
+.br
+.B todolet list
+.RI [ OFFSET ]
+.br
+.B todolet export
+.RI [ FILE ]
+.br
+.B todolet import
+.I FILE
+.br
+.B todolet ical
+.RI [ OFFSET | FILE ]
+.SH DESCRIPTION
+.B todolet
+is a terminal companion to the todolet.app web app: see the week ahead, add
+tasks to a day, tick them off. No accounts, no cloud, no dependencies \(em one
+Python file and a JSON file on your own machine.
+.PP
+Run with no arguments to open the interactive TUI. Press
+.B ?
+inside the TUI for the key reference.
+.SH COMMANDS
+.TP
+.BI add " TEXT " [ DAY ]
+Quick-add a task.
+.I DAY
+may be
+.BR today ,
+.BR tomorrow ,
+a weekday name
+.RB ( mon .. sun ),
+.BI + N
+days from today, or a
+.B YYYY-MM-DD
+date. Defaults to today.
+.TP
+.BI list " " [ OFFSET ]
+Print a week to stdout.
+.I OFFSET
+is in weeks:
+.BR 0 ", " +1 ", " \-2 ", ..."
+.TP
+.BI export " " [ FILE ]
+Write a backup JSON in the todolet.app backup format.
+.TP
+.BI import " FILE"
+Merge a backup JSON (accepts web-app backups). Tasks are merged by id and
+duplicates are skipped; nothing is deleted.
+.TP
+.BI ical " " [ OFFSET | FILE ]
+Export a week as an iCal
+.B .ics
+file.
+.TP
+.B help
+Show usage.
+.TP
+.B version
+Show the version.
+.SH FILES
+.TP
+.I ~/.local/share/todolet/todolet.json
+Task storage, in the same shape as the web app's localStorage, so backups
+move freely between phone and terminal in both directions.
+.SH SEE ALSO
+.UR https://todolet.app
+.UE
+.SH AUTHOR
+Chris Naylor
