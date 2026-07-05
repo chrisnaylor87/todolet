@@ -4,9 +4,13 @@
 see the week ahead, add tasks to a day, tick them off. No accounts, no cloud,
 no dependencies — one Python file and a JSON file on your own machine.
 
+![Todolet in the terminal: the week at a glance, adding and ticking off tasks](docs/demo.gif)
+
 ## Install
 
-On Debian, Ubuntu or Mint, grab the `.deb` from the latest release and:
+On Debian, Ubuntu or Mint, download the `.deb` from the
+[latest release](https://github.com/chrisnaylor87/todolet/releases/latest)
+and:
 
 ```sh
 sudo apt install ./todolet_1.0.0_all.deb
