@@ -1,7 +1,6 @@
 # Flathub manifest for Todolet.
 #
-# To submit: fill in the sha256 below (curl -L <url> | sha256sum), then follow
-# https://docs.flathub.org/docs/for-app-authors/submission
+# To submit: follow https://docs.flathub.org/docs/for-app-authors/submission
 # (PR against https://github.com/flathub/flathub adding this file).
 #
 # Test locally with:
@@ -26,4 +25,4 @@ modules:
     sources:
       - type: archive
         url: https://github.com/chrisnaylor87/todolet/archive/refs/tags/v1.0.0.tar.gz
-        sha256: FILL_IN_AFTER_TAGGING
+        sha256: 103ce791aa87c781e40ad594f61d91d17e5ae49b373d7764fe2627237882f242
